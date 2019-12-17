@@ -63,28 +63,73 @@ static void smr_resolve_addr(const char *node, const char *service,
 	(*addr)[*addrlen - 1]  = '\0';
 }
 
-static int smr_get_ptrace_scope(void)
+static int smr_check_cma_capability(void)
 {
-	FILE *file;
-	int scope, ret;
+	int shm_fd;
+	pid_t  pid;
+	uintptr_t *shared_memory;
+	int msize = sizeof(uintptr_t);
+	int ret;
+	char name[NAME_MAX];
+	snprintf(name, NAME_MAX - 1, "%s_%d", "cma_check", getpid());
 
-	scope = 0;
-	file = fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
-	if (file) {
-		ret = fscanf(file, "%d", &scope);
-		if (ret != 1) {
-			FI_WARN(&smr_prov, FI_LOG_CORE,
-				"Error getting value from ptrace_scope\n");
-			return -FI_EINVAL;
-		}
-		ret = fclose(file);
-		if (ret) {
-			FI_WARN(&smr_prov, FI_LOG_CORE,
-				"Error closing ptrace_scope file\n");
-			return -FI_EINVAL;
-		}
+	// shm file to exchange address and result of cma read
+	shm_fd = shm_open (name, O_CREAT | O_EXCL | O_RDWR, S_IRWXU | S_IRWXG);
+	if (shm_fd < 0) {
+		FI_WARN(&smr_prov, FI_LOG_CORE, "Error opening shm file for CMA check\n");
+		return -FI_EINVAL;
 	}
-	return scope;
+	ret = ftruncate(shm_fd, msize);
+	if (ret < 0) {
+		FI_WARN(&smr_prov, FI_LOG_CORE, "Error truncating shm file for CMA check\n");
+		ret = -FI_EINVAL;
+		goto err1;
+	}
+	shared_memory = (uintptr_t *) mmap(NULL, msize, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+	if (shared_memory == NULL) {
+		FI_WARN(&smr_prov, FI_LOG_CORE, "Error mapping shm file for CMA check\n");
+		ret = -FI_EINVAL;
+		goto err1;
+	}
+
+	pid = fork();
+	if (pid == 0) {
+	        // child process receives memory address, executes CMA read, and sends back the result
+	        usleep(1000);
+	        char buf_child[8];
+	        uintptr_t caddr;
+	        memcpy(&caddr, shared_memory, sizeof(uintptr_t));
+
+	        struct iovec local[1];
+	        struct iovec remote[1];
+	        local[0].iov_base = buf_child;
+	        local[0].iov_len = 8;
+	        remote[0].iov_base = (void *) (*shared_memory);
+	        remote[0].iov_len = 8;
+	        int nread;
+	        pid_t ppid = getppid();
+	        nread = process_vm_readv(ppid, local, 1, remote, 1, 0);
+	        if (nread == -1) {
+			FI_WARN(&smr_prov, FI_LOG_CORE, "Error child trying execute process_vm_readv on its parent: %s\n", strerror(errno));
+			ret = nread;
+		} else {
+			ret = 0;
+		}
+	        memcpy(shared_memory, &ret, sizeof(int));
+		exit(0);
+	} else {
+	        // parent process sends memory address and receives child's CMA read result
+	        char buf[8];
+	        memset(buf, 'A', 8);
+	        uintptr_t paddr = (uintptr_t) buf;
+	        memcpy(shared_memory, &paddr, sizeof(uintptr_t));
+	        wait(NULL);
+	        memcpy(&ret, shared_memory, sizeof(int));
+	}
+	munmap(shared_memory, msize);
+err1:
+	shm_unlink(name);
+	return ret;
 }
 
 static int smr_getinfo(uint32_t version, const char *node, const char *service,
@@ -94,7 +139,7 @@ static int smr_getinfo(uint32_t version, const char *node, const char *service,
 	struct fi_info *cur;
 	uint64_t mr_mode, msg_order;
 	int fast_rma;
-	int ptrace_scope, ret;
+	int cma_cap, ret;
 
 	mr_mode = hints && hints->domain_attr ? hints->domain_attr->mr_mode :
 						FI_MR_VIRT_ADDR;
@@ -106,7 +151,7 @@ static int smr_getinfo(uint32_t version, const char *node, const char *service,
 	if (ret)
 		return ret;
 
-	ptrace_scope = smr_get_ptrace_scope();
+	cma_cap = smr_check_cma_capability();
 
 	for (cur = *info; cur; cur = cur->next) {
 		if (!(flags & FI_SOURCE) && !cur->dest_addr)
@@ -128,7 +173,7 @@ static int smr_getinfo(uint32_t version, const char *node, const char *service,
 			cur->ep_attr->max_order_waw_size = 0;
 			cur->ep_attr->max_order_war_size = 0;
 		}
-		if (ptrace_scope != 0)
+		if (cma_cap != 0)
 			cur->ep_attr->max_msg_size = SMR_INJECT_SIZE;
 	}
 	return 0;
